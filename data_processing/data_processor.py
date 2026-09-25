@@ -100,7 +100,7 @@ class DataProcessor:
         input_chunk_length = self.fx_trading_config.INPUT_CHUNK_LENGTH
         fx_data_train, fx_data_val, fx_data_test = self.load_fx_data()
         news_data_train, news_data_test = self.load_news_data()
-
+        price_col = "close"
         # Aggregate news by minute with majority sentiment
         sentiment_col = self.fx_trading_config.SENTIMENT_SOURCE
         news_data_train = self._aggregate_news_by_minute(news_data_train, sentiment_col)
@@ -108,15 +108,15 @@ class DataProcessor:
 
         # Extract test metadata
         fx_timestamps = fx_data_test["date"].tolist()
-        bid_prices = fx_data_test["bid_price"].tolist()
-        ask_prices = fx_data_test["ask_price"].tolist()
+        bid_prices = fx_data_test[price_col].tolist()
+        ask_prices = fx_data_test[price_col].tolist()
         news_timestamps = news_data_test["date"].tolist()
         news_sentiments = news_data_test[sentiment_col].tolist()
 
         # --- Prepare Darts format data ---
-        darts_train = TimeSeries.from_dataframe(fx_data_train, value_cols=["mid_price"])
-        darts_val = TimeSeries.from_dataframe(fx_data_val, value_cols=["mid_price"])
-        darts_test = TimeSeries.from_dataframe(fx_data_test, value_cols=["mid_price"])
+        darts_train = TimeSeries.from_dataframe(fx_data_train, value_cols=[price_col])
+        darts_val = TimeSeries.from_dataframe(fx_data_val, value_cols=[price_col])
+        darts_test = TimeSeries.from_dataframe(fx_data_test, value_cols=[price_col])
 
         # Scale Darts series
         darts_scaler = Scaler()
@@ -125,9 +125,9 @@ class DataProcessor:
         darts_test_scaled = darts_scaler.transform(darts_test)
 
         # --- Prepare llm format data ---
-        llm_train = fx_data_train["mid_price"].values.reshape(-1, 1).astype(np.float32)
-        llm_val = fx_data_val["mid_price"].values.reshape(-1, 1).astype(np.float32)
-        llm_test = fx_data_test["mid_price"].values.reshape(-1, 1).astype(np.float32)
+        llm_train = fx_data_train[price_col].values.reshape(-1, 1).astype(np.float32)
+        llm_val = fx_data_val[price_col].values.reshape(-1, 1).astype(np.float32)
+        llm_test = fx_data_test[price_col].values.reshape(-1, 1).astype(np.float32)
 
         # Scale llm arrays
         llm_scaler = MinMaxScaler(feature_range=(0, 1))
@@ -141,7 +141,7 @@ class DataProcessor:
         test_ask_prices = ask_prices[input_chunk_length:]
 
         # Unscaled test mid prices for evaluation (with offset)
-        test_mid_prices = fx_data_test["mid_price"].values[input_chunk_length:].tolist()
+        test_mid_prices = fx_data_test[price_col].values[input_chunk_length:].tolist()
 
         return ProcessedData(
             darts_train_scaled=darts_train_scaled,
