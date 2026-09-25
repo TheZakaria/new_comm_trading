@@ -20,7 +20,7 @@ class FXTradingConfig:
     OUTPUT_DIR: str = "results/usd-cnh"
     NEWS_HOLD_MINUTES: int = 3
     ALLOW_NEWS_OVERLAP: bool = False
-    SENTIMENT_SOURCE: str = "competitor_label"
+    SENTIMENT_SOURCE: str = "label"
     KELLY_WINDOW_DAYS: int = None
     MIN_TRADES_FOR_FULL_KELLY: int = None
     MIN_KELLY_FRACTION: float = 0.005
