@@ -13,6 +13,7 @@ import torch
 import random
 from typing import List, Dict, Union
 from metrics import ModelEvalMetrics
+import json
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -289,6 +290,23 @@ def run_ml_based_trading_strategies(fx_trading_config):
 
     plt.clf()
 
+    profit_per_trade_data = {
+        "mean_reversion": trading_strategy.pnl["mean_reversion"],
+        "trend": trading_strategy.pnl["trend"],
+        "ma_crossover": trading_strategy.pnl["ma_crossover"],
+        "news_sentiment": trading_strategy.pnl["news_sentiment"]
+    }
+    
+    if is_ensemble_model:
+        profit_per_trade_data["ensemble"] = trading_strategy.pnl["ensemble"]
+    else:
+        profit_per_trade_data["model_driven"] = trading_strategy.pnl["model_driven"]
+
+    # Export to JSON
+    trades_output_path = os.path.join(fx_trading_config.OUTPUT_DIR, f'{fx_trading_config.MODEL_NAME}_profit_per_trade.json')
+    with open(trades_output_path, "w") as f:
+        json.dump(profit_per_trade_data, f, indent=4)
+
     print(f"\n\n\n")
     print(f"Prediction Errors: {prediction_errors}")
     print(f"Cummulative Mean Reversion Profit: {cumulative_mean_reversion_profit[-1]:.2f}")
@@ -392,8 +410,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_chunk_length", type=int, default=64, help="Length of the input sequences.")
     parser.add_argument("--output_chunk_length", type=int, default=1, help="Length of the output sequences.")
     parser.add_argument("--n_epochs", type=int, default=50, help="Number of training epochs.")
-    parser.add_argument("--train_batch_size", type=int, default=1024, help="Batch size for training.")
-    parser.add_argument("--eval_batch_size", type=int, default=128, help="Batch size for evaluation.")
+    parser.add_argument("--train_batch_size", type=int, default=96000, help="Batch size for training.")
+    parser.add_argument("--eval_batch_size", type=int, default=96000, help="Batch size for evaluation.")
     parser.add_argument(
         "--fx_data_path_train",
         type=str,
@@ -435,7 +453,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sentiment_source",
         type=str,
-        default="competitor_label",
+        default="label",
         help="Choose which sentiment label column to use for trading."
     )
     parser.add_argument(
