@@ -30,8 +30,11 @@ def group_data_by_date(
     bid_prices: List[float],
     ask_prices: List[float],
     news_sentiments: List[float],
+    min_first_hour_values: int = 0,
 ):
     """Group all test data by date for trading simulation.
+    Trades every day from the start of the day, but if fewer than `min_first_hour_values`
+    are observed between 9:00 and 9:59 AM, trading stops at 9:59 AM for the rest of that day.
 
     predicted_values can be:
         - list of floats
@@ -87,6 +90,57 @@ def group_data_by_date(
             continue
         chunked_values[date_key]["news_timestamps"].append(news_timestamp)
         chunked_values[date_key]["news_sentiments"].append(news_sentiment)
+
+    # Evaluate the 9:00-9:59 AM window for each day. If the count is below N,
+    # truncate that day's FX and news data at 9:59:59 AM so trading stops after 9:59 AM.
+    print("\n--- First Hour (09:00 - 09:59) Sparsity Check ---")
+    for date_key in sorted(chunked_values.keys()):
+        day_bucket = chunked_values[date_key]
+        total_day_values = len(day_bucket["fx_timestamps"])
+
+        # Count data points strictly inside 09:00:00 - 09:59:59
+        first_hour_count = sum(1 for ts in day_bucket["fx_timestamps"] if ts.hour == 9)
+
+        if first_hour_count < min_first_hour_values:
+            # Keep only timestamps up through 09:59:59 (ts.hour < 10)
+            valid_fx_indices = [
+                idx for idx, ts in enumerate(day_bucket["fx_timestamps"]) if ts.hour < 10
+            ]
+
+            day_bucket["fx_timestamps"] = [day_bucket["fx_timestamps"][idx] for idx in valid_fx_indices]
+            day_bucket["true_values"] = [day_bucket["true_values"][idx] for idx in valid_fx_indices]
+            day_bucket["bid_prices"] = [day_bucket["bid_prices"][idx] for idx in valid_fx_indices]
+            day_bucket["ask_prices"] = [day_bucket["ask_prices"][idx] for idx in valid_fx_indices]
+
+            if isinstance(day_bucket["predicted_values"], list):
+                day_bucket["predicted_values"] = [
+                    day_bucket["predicted_values"][idx] for idx in valid_fx_indices
+                ]
+            elif isinstance(day_bucket["predicted_values"], dict):
+                for model_name in day_bucket["predicted_values"]:
+                    day_bucket["predicted_values"][model_name] = [
+                        day_bucket["predicted_values"][model_name][idx] for idx in valid_fx_indices
+                    ]
+
+            # Also truncate news events after 09:59:59 so news strategies stop for the day as well
+            valid_news_indices = [
+                idx for idx, ts in enumerate(day_bucket["news_timestamps"]) if ts.hour < 10
+            ]
+            day_bucket["news_timestamps"] = [day_bucket["news_timestamps"][idx] for idx in valid_news_indices]
+            day_bucket["news_sentiments"] = [day_bucket["news_sentiments"][idx] for idx in valid_news_indices]
+
+            print(
+                f"[{date_key}] Found {first_hour_count} values in 09:00-09:59 "
+                f"(required >= {min_first_hour_values}) -> STOPPING AT 09:59 "
+                f"(traded {len(valid_fx_indices)}/{total_day_values} values)"
+            )
+        else:
+            print(
+                f"[{date_key}] Found {first_hour_count} values in 09:00-09:59 "
+                f"(required >= {min_first_hour_values}) -> CONTINUING FULL DAY "
+                f"({total_day_values} values)"
+            )
+    print("-------------------------------------------------\n")
 
     return chunked_values
 
@@ -153,7 +207,8 @@ def run_ml_based_trading_strategies(fx_trading_config):
         predicted_values,
         test_bid_prices,
         test_ask_prices,
-        test_news_sentiments
+        test_news_sentiments,
+        min_first_hour_values=getattr(fx_trading_config, "MIN_FIRST_HOUR_VALUES", 0),
     )
 
     date_key_list = []
@@ -199,40 +254,42 @@ def run_ml_based_trading_strategies(fx_trading_config):
         prev_news_sentiment_profit = sum(trading_strategy.pnl["news_sentiment"])
         prev_ensemble_profit = sum(trading_strategy.pnl["ensemble"])
 
-        if is_ensemble_model:
-            # Run mean reversion, trend, and news sentiment using only actual rates
-            # (place-holder predictions so that strategies not using them still work)
-            trading_strategy.simulate_trading_with_strategies(
-                values['fx_timestamps'],
-                values['true_values'],
-                values['true_values'],
-                values['bid_prices'],
-                values['ask_prices'],
-                values['news_timestamps'],
-                values['news_sentiments'],
-                strategy_names=['mean_reversion', 'trend'],
-            )
+        # in case a day had 0 data points prior to 10:00 AM and was truncated to an empty list.
+        if len(values['fx_timestamps']) > 0:
+            if is_ensemble_model:
+                # Run mean reversion, trend, and news sentiment using only actual rates
+                # (place-holder predictions so that strategies not using them still work)
+                trading_strategy.simulate_trading_with_strategies(
+                    values['fx_timestamps'],
+                    values['true_values'],
+                    values['true_values'],
+                    values['bid_prices'],
+                    values['ask_prices'],
+                    values['news_timestamps'],
+                    values['news_sentiments'],
+                    strategy_names=['mean_reversion', 'trend'],
+                )
 
-            # Run the ensemble meta-model strategy using per-model predictions
-            trading_strategy.simulate_trading_with_ensemble_strategy(
-                values['fx_timestamps'],
-                values['true_values'],
-                values['predicted_values'],
-                values['bid_prices'],
-                values['ask_prices'],
-                seed=fx_trading_config.SEED,
-            )
-        else:
-            # Non-ensemble models: run mean reversion, trend, model-driven, and news sentiment
-            trading_strategy.simulate_trading_with_strategies(
-                values['fx_timestamps'],
-                values['true_values'],
-                values['predicted_values'],
-                values['bid_prices'],
-                values['ask_prices'],
-                values['news_timestamps'],
-                values['news_sentiments'],
-            )
+                # Run the ensemble meta-model strategy using per-model predictions
+                trading_strategy.simulate_trading_with_ensemble_strategy(
+                    values['fx_timestamps'],
+                    values['true_values'],
+                    values['predicted_values'],
+                    values['bid_prices'],
+                    values['ask_prices'],
+                    seed=fx_trading_config.SEED,
+                )
+            else:
+                # Non-ensemble models: run mean reversion, trend, model-driven, and news sentiment
+                trading_strategy.simulate_trading_with_strategies(
+                    values['fx_timestamps'],
+                    values['true_values'],
+                    values['predicted_values'],
+                    values['bid_prices'],
+                    values['ask_prices'],
+                    values['news_timestamps'],
+                    values['news_sentiments'],
+                )
 
         current_mean_reversion_profit = sum(trading_strategy.pnl["mean_reversion"])
         current_trend_profit = sum(trading_strategy.pnl["trend"])
@@ -346,6 +403,7 @@ def run(args):
     fx_trading_config.THRESHOLD = args.threshold
     fx_trading_config.FAST_MA_WINDOW = args.fast_ma_window
     fx_trading_config.SLOW_MA_WINDOW = args.slow_ma_window
+    fx_trading_config.MIN_FIRST_HOUR_VALUES = args.min_first_hour_values
 
     root_dir = os.path.dirname(os.path.abspath(__file__))
     fx_trading_config.OUTPUT_DIR = os.path.join(root_dir, args.output_dir)
@@ -386,6 +444,7 @@ def print_fx_trading_config(config):
     print(f"  Threshold                 : {config.THRESHOLD}")
     print(f"  Fast MA Window            : {config.FAST_MA_WINDOW}")
     print(f"  Slow MA Window            : {config.SLOW_MA_WINDOW}")
+    print(f"  Min First Hour Values     : {getattr(config, 'MIN_FIRST_HOUR_VALUES', 0)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -490,6 +549,12 @@ if __name__ == "__main__":
         type=int,
         default=30,
         help="Window size for slow moving average. Default: 30.")
+    parser.add_argument(
+        "--min_first_hour_values",
+        type=int,
+        default=0,
+        help="Minimum number of FX data points required between 9:00 and 9:59 AM to continue trading past 9:59 AM. Default: 0."
+    )
 
     args = parser.parse_args()
 

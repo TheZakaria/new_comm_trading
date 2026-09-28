@@ -13,6 +13,7 @@ class FXTradingConfig:
     FX_DATA_PATH_TEST: str = "ml_fx_trading/dataset/fx/usdcnh-fx-test.csv"
     NEWS_DATA_PATH_TRAIN: str = "ml_fx_trading/dataset/news/usdcnh-news-train.csv"
     NEWS_DATA_PATH_TEST: str = "ml_fx_trading/dataset/news/usdcnh-news-test.csv"
+    MIN_FIRST_HOUR_VALUES: int = 0
     WALLET_A: float = 10000.0
     WALLET_B: float = 10000.0
     BET_SIZING: str = "fixed"
