@@ -233,7 +233,7 @@ def run_ml_based_trading_strategies(fx_trading_config, train_df, val_df, test_df
     prediction_errors = None
     if fx_trading_config.MODEL_NAME != 'ensemble':
         prediction_errors = metrics.calculate_prediction_errors(true_values, predicted_values)
-        metrics.rmse = prediction_errors.get("rmse", 0) # ensure metric is saved
+        metrics.rmse = prediction_errors.get("RMSE", -999)
 
     chunked_values = group_data_by_date(
         test_fx_timestamps, test_news_timestamps, true_values, predicted_values,
