@@ -111,7 +111,7 @@ def group_data_by_date(
         # =====================================================================
         # Stop trading entirely once a specific date is reached.
         # =====================================================================
-        stop_date = pd.Timestamp(year=2026, month=04, day=01, tz="UTC").date()
+        stop_date = pd.Timestamp(year=2026, month=4, day=1, tz="UTC").date()
         if fx_timestamp.date() >= stop_date:
             continue
 
@@ -330,7 +330,7 @@ def run_sliding_window_pipeline(args):
             print(f"Skipping {fold['period_id']} (insufficient data).")
             continue
 
-        news_train, news_test = None
+        news_train, news_test = None, None
         if master_news_df is not None:
             news_train = master_news_df[(master_news_df['date'] >= t_start) & (master_news_df['date'] < v_end)]
             news_test = master_news_df[(master_news_df['date'] >= v_end) & (master_news_df['date'] < test_end)]
