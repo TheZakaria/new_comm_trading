@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-
+from typing import Optional
 @dataclass
 class FXTradingConfig:
     MODEL_NAME: str = "tcn"
@@ -8,12 +8,16 @@ class FXTradingConfig:
     N_EPOCHS: int = 3
     TRAIN_BATCH_SIZE: int = 1024
     EVAL_BATCH_SIZE: int = 128
-    FX_DATA_PATH_TRAIN: str = "ml_fx_trading/dataset/fx/usdcnh-fx-train.csv"
-    FX_DATA_PATH_VAL: str = "ml_fx_trading/dataset/fx/usdcnh-fx-val.csv"
-    FX_DATA_PATH_TEST: str = "ml_fx_trading/dataset/fx/usdcnh-fx-test.csv"
-    NEWS_DATA_PATH_TRAIN: str = "ml_fx_trading/dataset/news/usdcnh-news-train.csv"
-    NEWS_DATA_PATH_TEST: str = "ml_fx_trading/dataset/news/usdcnh-news-test.csv"
+
+    MASTER_FX_FILE: str = "dataset/corn_futures.csv"
+    MASTER_NEWS_FILE: Optional[str] = "dataset/news/usdbrl-news.csv"
+    TRAIN_WINDOW: str = "1M"
+    VAL_WINDOW: str = "1M"
+    TEST_WINDOW: str = "1M"
+    WINDOW_STEP: str = "3M"
+
     MIN_FIRST_HOUR_VALUES: int = 0
+    
     WALLET_A: float = 10000.0
     WALLET_B: float = 10000.0
     BET_SIZING: str = "fixed"

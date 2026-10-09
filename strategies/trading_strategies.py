@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
@@ -30,12 +31,18 @@ class TradingStrategy():
         self.slow_ma_window = slow_ma_window
 
         strategies = ['mean_reversion', 'trend', 'ma_crossover', 'model_driven', 'news_sentiment', 'ensemble']
+        
         # Initialize wallets for different trading strategies
         self.wallet_a = {s: wallet_a for s in strategies}
         self.wallet_b = {s: wallet_b for s in strategies}
+        
         # Track profit/loss, wins/losses, and total gains/losses for each strategy
         self.pnl = {s: [] for s in strategies}
         self.num_trades = {s: 0 for s in strategies}
+        
+        # --- NEW: Detailed Timestamped Trade Records ---
+        self.trade_records = {s: [] for s in strategies}
+        
         # Tracks open positions for each strategy
         self.single_slot_positions = {
             s: {
@@ -272,7 +279,6 @@ class TradingStrategy():
             return self.min_kelly_fraction
 
         h = abs(estimated_gain) / (est_gain_sum / est_gain_count)
-
         f = p - (q / (h * win_loss_ratio))
 
         return max(f, 0.0)
@@ -280,7 +286,6 @@ class TradingStrategy():
     def _track_potential_outcome(self, strategy_name, prev_trade_direction, actual_pct_change):
         """
         Track whether a hypothetical trade from the previous timestep would have been a win.
-        This is called at each timestep to evaluate what would have happened if we had traded.
         """
         if prev_trade_direction == 'no_trade':
             return
@@ -304,14 +309,7 @@ class TradingStrategy():
         fast_ma_curr,
         slow_ma_curr,
     ):
-        """MA crossover single slot.
-
-        If flat, open from ``trade_direction``. If in a trade, close and reopen from
-        ``trade_direction`` only when MAs match or the signal opposes the position; otherwise
-        append zero PnL for this bar and return.
-
-        Returns True if an open or close/reopen occurred this bar.
-        """
+        """MA crossover single slot."""
         strategy_name = 'ma_crossover'
         position = self.single_slot_positions[strategy_name]
 
@@ -334,7 +332,7 @@ class TradingStrategy():
             self.pnl[strategy_name].append(0.0)
             return False
 
-        self.close_position(strategy_name, sell_price, buy_price)
+        self.close_position(strategy_name, sell_price, buy_price, fx_timestamp)
         self._open_single_position(
             strategy_name, fx_timestamp, trade_direction, buy_price, sell_price, estimated_gain
         )
@@ -351,20 +349,13 @@ class TradingStrategy():
         fast_ma_curr=None,
         slow_ma_curr=None,
     ):
-        """Calculate profit/loss and handle position management.
-
-        For ``ma_crossover`` only: pass ``fast_ma_curr`` and ``slow_ma_curr`` for this bar so exits
-        (MA touch vs position, opposing crossover) can be decided here together with opens/closes.
-        """
-        # Determine pricing based on transaction costs setting
+        """Calculate profit/loss and handle position management."""
         buy_price, sell_price = self._get_prices(bid_price, ask_price)
 
-        # -------- MA crossover (single-slot; holds across bars until exit rule fires) --------
+        # -------- MA crossover --------
         if strategy_name == 'ma_crossover':
             if fast_ma_curr is None or slow_ma_curr is None:
-                raise ValueError(
-                    "execute_trade for ma_crossover requires keyword arguments fast_ma_curr and slow_ma_curr"
-                )
+                raise ValueError("execute_trade for ma_crossover requires fast_ma_curr and slow_ma_curr")
             return self._handle_ma_crossover_single_slot(
                 fx_timestamp,
                 trade_direction,
@@ -377,25 +368,21 @@ class TradingStrategy():
 
         # -------- NEWS (overlap path) --------
         if strategy_name == 'news_sentiment' and self.allow_news_overlap:
-            # 1) close any expired news positions first
             still_open = []
             for pos in self.multi_slot_positions[strategy_name]:
                 if pos['hold_minutes'] == self.no_hold or (fx_timestamp - pos['entry_timestamp']) >= datetime.timedelta(minutes=pos['hold_minutes']):
-                    self._close_single_position(strategy_name, pos, sell_price, buy_price)
+                    self._close_single_position(strategy_name, pos, sell_price, buy_price, fx_timestamp)
                 else:
                     still_open.append(pos)
             self.multi_slot_positions[strategy_name] = still_open
             self._open_single_position(strategy_name, fx_timestamp, trade_direction, buy_price, sell_price, estimated_gain)
             return
 
-        # -------- DEFAULT (single-slot) for all other strategies (and news when overlap disabled) --------
+        # -------- DEFAULT (single-slot) --------
         position = self.single_slot_positions[strategy_name]
-
-        # Check if there's an open position
         if position['type'] is not None:
             if position['hold_minutes'] == self.no_hold or (fx_timestamp - position['entry_timestamp']) >= datetime.timedelta(minutes=position['hold_minutes']):
-                # Close the position
-                self.close_position(strategy_name, sell_price, buy_price)
+                self.close_position(strategy_name, sell_price, buy_price, fx_timestamp)
             else:
                 return
 
@@ -407,10 +394,8 @@ class TradingStrategy():
             self.pnl[strategy_name].append(0.0)
             return
 
-        # 1) Total portfolio value in currency A
         total_value_in_a = self.wallet_a[strategy_name] + (self.wallet_b[strategy_name] / buy_price)
 
-        # 2) Position sizing (Kelly or fixed)
         if self.bet_sizing != 'fixed' and strategy_name != 'news_sentiment':
             f_i = self.kelly_criterion(strategy_name, estimated_gain)
             if f_i <= 0:
@@ -420,137 +405,116 @@ class TradingStrategy():
         else:
             base_bet_size_a = self.fixed_position_size
 
-        # 3) Direction-specific bet sizes and balance checks
         if trade_direction == 'buy_currency_a':  # LONG
             bet_size_a = min(base_bet_size_a, self.wallet_b[strategy_name] / buy_price)
             bet_size_b = bet_size_a * buy_price
 
-            if bet_size_b > self.wallet_b[strategy_name] or bet_size_a <= 0:
-                return
+            if bet_size_b > self.wallet_b[strategy_name] or bet_size_a <= 0: return
 
-            # Update wallets
             self.wallet_a[strategy_name] += bet_size_a
             self.wallet_b[strategy_name] -= bet_size_b
-
-            pos_type = 'long'
-            entry_ratio = buy_price
+            pos_type, entry_ratio = 'long', buy_price
 
         elif trade_direction == 'sell_currency_a':  # SHORT
             bet_size_a = min(base_bet_size_a, self.wallet_a[strategy_name])
             bet_size_b = bet_size_a * sell_price
 
-            if bet_size_a > self.wallet_a[strategy_name] or bet_size_a <= 0:
-                return
+            if bet_size_a > self.wallet_a[strategy_name] or bet_size_a <= 0: return
 
-            # Update wallets
             self.wallet_a[strategy_name] -= bet_size_a
             self.wallet_b[strategy_name] += bet_size_b
+            pos_type, entry_ratio = 'short', sell_price
 
-            pos_type = 'short'
-            entry_ratio = sell_price
-
-        # 4) Record open position (single-slot store)
         hold_mins = (self.news_hold_minutes if strategy_name == 'news_sentiment' else self.no_hold)
 
         if strategy_name != 'news_sentiment':
             self._kelly_estimated_gains[strategy_name].append((self._kelly_day_index, abs(estimated_gain)))
 
-        if strategy_name == 'news_sentiment' and self.allow_news_overlap:
-            self.multi_slot_positions[strategy_name].append({
-                'type': pos_type,
-                'size_a': bet_size_a,
-                'size_b': bet_size_b,
-                'entry_ratio': entry_ratio,
-                'entry_timestamp': fx_timestamp,
-                'hold_minutes': hold_mins,
-            })
-        else:
-            self.single_slot_positions[strategy_name] = {
-                'type': pos_type,
-                'size_a': bet_size_a,
-                'size_b': bet_size_b,
-                'entry_ratio': entry_ratio,
-                'entry_timestamp': fx_timestamp,
-                'hold_minutes': hold_mins,
-            }
+        pos_dict = {
+            'type': pos_type,
+            'size_a': bet_size_a,
+            'size_b': bet_size_b,
+            'entry_ratio': entry_ratio,
+            'entry_timestamp': fx_timestamp,
+            'hold_minutes': hold_mins,
+        }
 
-    def _close_single_position(self, strategy_name, position, sell_price, buy_price):
+        if strategy_name == 'news_sentiment' and self.allow_news_overlap:
+            self.multi_slot_positions[strategy_name].append(pos_dict)
+        else:
+            self.single_slot_positions[strategy_name] = pos_dict
+
+    def _close_single_position(self, strategy_name, position, sell_price, buy_price, exit_timestamp):
         """Close an open position and calculate profit/loss"""
         profit_in_curr_b = 0.0
 
         if position['type'] == 'long':
-            # Close long position: sell currency A for currency B
             exit_amount_b = position['size_a'] * sell_price
-
-            # Calculate profit in currency B terms
             profit_in_curr_b = exit_amount_b - position['size_b']
-
-            # Convert realized B-PnL to A at the close (sell) rate
             profit_in_curr_a = profit_in_curr_b / sell_price
 
-            # Update wallets
             self.wallet_a[strategy_name] -= position['size_a']
             self.wallet_b[strategy_name] += exit_amount_b
 
         elif position['type'] == 'short':
-            # Close short position: buy back currency A with currency B
             cost_to_buyback_a = position['size_a'] * buy_price
-
-            # Calculate profit in currency B terms
             profit_in_curr_b = position['size_b'] - cost_to_buyback_a
-
-            # Convert realized B-PnL to A at the close (buy) rate
             profit_in_curr_a = profit_in_curr_b / buy_price
 
-            # Update wallets
             self.wallet_b[strategy_name] -= cost_to_buyback_a
             self.wallet_a[strategy_name] += position['size_a']
 
         if profit_in_curr_a != 0:
             self._kelly_actual_outcomes[strategy_name].append((self._kelly_day_index, profit_in_curr_a))
 
-        # Update profit tracking
+        # --- RECORD THE TRADE ---
+        entry_ts = pd.Timestamp(position['entry_timestamp'])
+        exit_ts = pd.Timestamp(exit_timestamp) if exit_timestamp else None
+        
+        # Pull namespace ID if available
+        period_id = "single_period"
+        if hasattr(self, 'config') and hasattr(self.config, 'period_id'):
+            period_id = self.config.period_id
+
+        self.trade_records[strategy_name].append({
+            "period_id": period_id,
+            "timestamp": entry_ts.isoformat(),
+            "date": str(entry_ts.date()),
+            "hour": int(entry_ts.hour),
+            "exit_timestamp": exit_ts.isoformat() if exit_ts else None,
+            "direction": 1 if position['type'] == 'long' else -1,
+            "position_size": float(position['size_a']),
+            "profit": float(profit_in_curr_a),
+        })
+
+        # Update profit tracking lists
         self.num_trades[strategy_name] += 1
         self.pnl[strategy_name].append(profit_in_curr_a)
 
-    def close_position(self, strategy_name, sell_price, buy_price):
+    def close_position(self, strategy_name, sell_price, buy_price, exit_timestamp):
         position = self.single_slot_positions[strategy_name]
         if position['type'] is None:
             return
-        self._close_single_position(strategy_name, position, sell_price, buy_price)
-        self.single_slot_positions[strategy_name] = {'type': None, 'size_a': 0, 'size_b': 0, 'entry_ratio': 0, 'entry_timestamp': None,
-                                            'hold_minutes': self.news_hold_minutes if strategy_name == 'news_sentiment' else self.no_hold}
+        self._close_single_position(strategy_name, position, sell_price, buy_price, exit_timestamp)
+        self.single_slot_positions[strategy_name] = {
+            'type': None, 'size_a': 0, 'size_b': 0, 'entry_ratio': 0, 
+            'entry_timestamp': None, 'hold_minutes': self.news_hold_minutes if strategy_name == 'news_sentiment' else self.no_hold
+        }
 
     def determine_trade_direction(self, strategy_name, base_pct_change, pred_pct_change):
-        """Determine the trade direction based on strategy and ratio changes."""
         trade_direction = 'no_trade'
-
         if(strategy_name == "mean_reversion"):
-            if base_pct_change < -self.threshold:
-                trade_direction = 'buy_currency_a'
-            elif base_pct_change > self.threshold:
-                trade_direction = 'sell_currency_a'
-
+            if base_pct_change < -self.threshold: trade_direction = 'buy_currency_a'
+            elif base_pct_change > self.threshold: trade_direction = 'sell_currency_a'
         elif(strategy_name == "trend"):
-            if base_pct_change < -self.threshold:
-                trade_direction = 'sell_currency_a'
-            elif base_pct_change > self.threshold:
-                trade_direction = 'buy_currency_a'
-
+            if base_pct_change < -self.threshold: trade_direction = 'sell_currency_a'
+            elif base_pct_change > self.threshold: trade_direction = 'buy_currency_a'
         elif(strategy_name == "model_driven"):
-            if pred_pct_change < -self.threshold:
-                trade_direction = 'sell_currency_a'
-            elif pred_pct_change > self.threshold:
-                trade_direction = 'buy_currency_a'
-
+            if pred_pct_change < -self.threshold: trade_direction = 'sell_currency_a'
+            elif pred_pct_change > self.threshold: trade_direction = 'buy_currency_a'
         return trade_direction
 
     def determine_ma_crossover_trade_direction(self, fast_ma_prev, fast_ma_curr, slow_ma_prev, slow_ma_curr):
-        """Determine trade direction based on moving average crossover.
-        
-        Golden cross (fast crosses above slow) → buy currency A.
-        Death cross (fast crosses below slow)  → sell currency A.
-        """
         if fast_ma_prev <= slow_ma_prev and fast_ma_curr > slow_ma_curr:
             return 'buy_currency_a'
         elif fast_ma_prev >= slow_ma_prev and fast_ma_curr < slow_ma_curr:
@@ -559,43 +523,27 @@ class TradingStrategy():
 
     @staticmethod
     def _ma_crossover_mas_equal(fast_ma_curr, slow_ma_curr):
-        """True when fast and slow SMA are equal (within floating-point tolerance)."""
         return np.isclose(fast_ma_curr, slow_ma_curr)
 
     def determine_news_sentiment_trade_direction(self, news_sentiment):
-        """Determine the trade direction based on news sentiment."""
         trade_direction = 'no_trade'
-
-        if(news_sentiment == -1):
-            trade_direction = 'buy_currency_a'
-        elif(news_sentiment == 1):
-            trade_direction = 'sell_currency_a'
-
+        if(news_sentiment == -1): trade_direction = 'buy_currency_a'
+        elif(news_sentiment == 1): trade_direction = 'sell_currency_a'
         return trade_direction
 
     def _generate_training_data(self, actual_rates, pred_rates):
-        """Generate training data for the ensemble model."""
         X, y = [], []
         base_pct_incs, pred_pct_incs = TradingUtils.calculate_pct_inc(actual_rates, pred_rates)
         model_keys = list(pred_pct_incs.keys())
-
         for i in range(1, len(actual_rates) - 2):
             pred_features_i = [pred_pct_incs[m][i] for m in model_keys]
-            feature = [
-                base_pct_incs[i],
-                *pred_features_i,
-            ]
+            feature = [base_pct_incs[i], *pred_features_i]
             X.append(feature)
-
-            # Direction label by next price
             y.append(base_pct_incs[i + 1])
-
         return list(zip(X, y))
 
     def _execute_trading_strategy(self, strategy_name, fx_timestamps, actual_rates, pred_rates, bid_prices, ask_prices):
-        """Helper method to execute trading for a specific strategy."""
         base_pct_incs, pred_pct_incs = TradingUtils.calculate_pct_inc(actual_rates, pred_rates)
-
         prev_trade_direction = None
 
         for i in range(1, len(actual_rates) - 1):
@@ -606,40 +554,21 @@ class TradingStrategy():
             base_pct_inc = base_pct_incs[i]
             pred_pct_inc = pred_pct_incs[i]
 
-            # Track potential outcome from previous timestep's hypothetical trade
             if prev_trade_direction is not None:
                 self._track_potential_outcome(strategy_name, prev_trade_direction, base_pct_inc)
 
-            # Determine trade direction
-            trade_direction = self.determine_trade_direction(
-                strategy_name, base_pct_inc, pred_pct_inc
-            )
-
-            # Store for next iteration's potential outcome tracking
+            trade_direction = self.determine_trade_direction(strategy_name, base_pct_inc, pred_pct_inc)
             prev_trade_direction = trade_direction
 
-            estimated_gain = base_pct_inc
-            if strategy_name == 'model_driven':
-                estimated_gain = pred_pct_inc
-
-            # Execute trade
+            estimated_gain = pred_pct_inc if strategy_name == 'model_driven' else base_pct_inc
             self.execute_trade(strategy_name, curr_fx_timestamp, trade_direction, curr_bid_price, curr_ask_price, estimated_gain)
 
     def _execute_ma_crossover_strategy(self, fx_timestamps, actual_rates, bid_prices, ask_prices):
-        """Execute moving average crossover strategy.
-        
-        Computes fast and slow simple moving averages over actual_rates and
-        trades on crossover events.  Requires at least slow_ma_window data
-        points before the first signal can fire.
-        """
         strategy_name = 'ma_crossover'
         n = len(actual_rates)
-
-        if n < self.slow_ma_window + 1:
-            return
+        if n < self.slow_ma_window + 1: return
 
         rates = np.array(actual_rates, dtype=np.float64)
-
         fast_cumsum = np.cumsum(rates)
         slow_cumsum = fast_cumsum.copy()
         fast_ma = np.empty(n, dtype=np.float64)
@@ -661,7 +590,6 @@ class TradingStrategy():
                 slow_ma[i] = (slow_cumsum[i] - slow_cumsum[i - self.slow_ma_window]) / self.slow_ma_window
 
         prev_trade_direction = None
-
         for i in range(self.slow_ma_window, n - 1):
             curr_fx_timestamp = fx_timestamps[i]
             curr_bid_price = bid_prices[i]
@@ -677,200 +605,114 @@ class TradingStrategy():
             )
 
             if trade_direction != 'no_trade':
-                fast_window_return = abs(
-                    (rates[i] - rates[i - self.fast_ma_window]) / rates[i - self.fast_ma_window]
-                )
-                slow_window_return = abs(
-                    (rates[i] - rates[i - self.slow_ma_window]) / rates[i - self.slow_ma_window]
-                )
+                fast_window_return = abs((rates[i] - rates[i - self.fast_ma_window]) / rates[i - self.fast_ma_window])
+                slow_window_return = abs((rates[i] - rates[i - self.slow_ma_window]) / rates[i - self.slow_ma_window])
                 estimated_gain = min(fast_window_return, slow_window_return)
             else:
                 estimated_gain = 0.0
 
             trade_placed = self.execute_trade(
-                strategy_name,
-                curr_fx_timestamp,
-                trade_direction,
-                curr_bid_price,
-                curr_ask_price,
-                estimated_gain,
-                fast_ma_curr=fast_ma[i],
-                slow_ma_curr=slow_ma[i],
+                strategy_name, curr_fx_timestamp, trade_direction, curr_bid_price, curr_ask_price,
+                estimated_gain, fast_ma_curr=fast_ma[i], slow_ma_curr=slow_ma[i],
             )
 
             if trade_placed:
                 pos_type = self.single_slot_positions[strategy_name]['type']
-                if pos_type == 'long':
-                    prev_trade_direction = 'buy_currency_a'
-                elif pos_type == 'short':
-                    prev_trade_direction = 'sell_currency_a'
-                else:
-                    prev_trade_direction = None
+                if pos_type == 'long': prev_trade_direction = 'buy_currency_a'
+                elif pos_type == 'short': prev_trade_direction = 'sell_currency_a'
+                else: prev_trade_direction = None
             else:
                 prev_trade_direction = None
 
     def _execute_ensemble_strategy(self, fx_timestamps, actual_rates, pred_rates, bid_prices, ask_prices):
-        """Helper method to execute ensemble trading strategy."""
         strategy_name = "ensemble"
         base_pct_incs, pred_pct_incs = TradingUtils.calculate_pct_inc(actual_rates, pred_rates)
         model_keys = list(pred_pct_incs.keys())
-
         prev_trade_direction = None
 
         for i in range(1, len(actual_rates) - 1):
             base_pct_inc = base_pct_incs[i]
-
-            # Track potential outcome from previous timestep's hypothetical trade
             if prev_trade_direction is not None:
                 self._track_potential_outcome(strategy_name, prev_trade_direction, base_pct_inc)
 
-            # If model not trained yet, make no trades
             if not self.ensemble_model_trained:
                 trade_direction = 'no_trade'
                 estimated_gain = 0.0
             else:
                 pred_features_i = [pred_pct_incs[m][i] for m in model_keys]
-                feature = [
-                    base_pct_inc,
-                    *pred_features_i,
-                ]
-
-                feature_vector = np.array(feature).reshape(1, -1)
-                # Scale features using fitted scaler
-                feature_vector_scaled = self.scaler_X.transform(feature_vector)
-                # Predict in scaled space
+                feature = [base_pct_inc, *pred_features_i]
+                feature_vector_scaled = self.scaler_X.transform(np.array(feature).reshape(1, -1))
                 y_pred_scaled = self.ensemble_model.predict(feature_vector_scaled)[0]
-                # Inverse transform to get prediction in original scale
                 y_pred = self.scaler_y.inverse_transform([[y_pred_scaled]])[0, 0]
                 
-                if y_pred < -self.threshold:
-                    trade_direction = 'sell_currency_a'
-                elif y_pred > self.threshold:
-                    trade_direction = 'buy_currency_a'
-                else:
-                    trade_direction = 'no_trade'
+                if y_pred < -self.threshold: trade_direction = 'sell_currency_a'
+                elif y_pred > self.threshold: trade_direction = 'buy_currency_a'
+                else: trade_direction = 'no_trade'
                 estimated_gain = y_pred
 
-            # Store for next iteration's potential outcome tracking
             prev_trade_direction = trade_direction
-
             curr_fx_timestamp = fx_timestamps[i]
             curr_bid_price = bid_prices[i]
             curr_ask_price = ask_prices[i]
-
-            # Execute trade
             self.execute_trade(strategy_name, curr_fx_timestamp, trade_direction, curr_bid_price, curr_ask_price, estimated_gain)
 
     def _maybe_close_position(self, strategy_name, fx_timestamp, bid_price, ask_price):
-        """Helper method to maybe close a position for news sentiment strategy."""
         buy_price, sell_price = self._get_prices(bid_price, ask_price)
-
         if strategy_name == 'news_sentiment' and self.allow_news_overlap:
-            # close any expired stacked positions
             still_open = []
             for pos in self.multi_slot_positions['news_sentiment']:
                 if pos['hold_minutes'] == self.no_hold or (fx_timestamp - pos['entry_timestamp']) >= datetime.timedelta(minutes=pos['hold_minutes']):
-                    self._close_single_position('news_sentiment', pos, sell_price, buy_price)
+                    self._close_single_position('news_sentiment', pos, sell_price, buy_price, fx_timestamp)
                 else:
                     still_open.append(pos)
             self.multi_slot_positions['news_sentiment'] = still_open
             return
 
         position = self.single_slot_positions[strategy_name]
-
-        # Check if there's an open position
         if position['type'] is not None:
             if position['hold_minutes'] == self.no_hold or (fx_timestamp - position['entry_timestamp']) >= datetime.timedelta(minutes=position['hold_minutes']):
-                # Close the position
-                self.close_position(strategy_name, sell_price, buy_price)
+                self.close_position(strategy_name, sell_price, buy_price, fx_timestamp)
 
     def _execute_news_sentiment_strategy(self, fx_timestamps, bid_prices, ask_prices, news_timestamps, news_sentiments):
-        """Helper method to execute news sentiment strategy."""
         strategy_name = "news_sentiment"
         MAX_DIFF = datetime.timedelta(seconds=90)
-
-        j = 0  # pointer over news arrays
-        n = len(news_timestamps)
+        j, n = 0, len(news_timestamps)
 
         for i, curr_fx_timestamp in enumerate(fx_timestamps):
-            curr_bid_price = bid_prices[i]
-            curr_ask_price = ask_prices[i]
-
-            # 1) Time-based close: fire as soon as the hold window has elapsed
+            curr_bid_price, curr_ask_price = bid_prices[i], ask_prices[i]
             self._maybe_close_position(strategy_name, curr_fx_timestamp, curr_bid_price, curr_ask_price)
 
-            # 2) Consume all news that occurred up to (and including) this tick
             while j < n and news_timestamps[j] < curr_fx_timestamp:
                 diff = curr_fx_timestamp - news_timestamps[j]
-
                 if diff <= MAX_DIFF:
-                    curr_news_sentiment = news_sentiments[j]
-                    trade_direction = self.determine_news_sentiment_trade_direction(curr_news_sentiment)
-                    # Execute trade
+                    trade_direction = self.determine_news_sentiment_trade_direction(news_sentiments[j])
                     self.execute_trade(strategy_name, curr_fx_timestamp, trade_direction, curr_bid_price, curr_ask_price)
-
                 j += 1
 
-    def _close_all_remaining_positions(self, strategy_names, bid_price, ask_price):
-        """Helper method to close any remaining open positions for all strategies."""
+    def _close_all_remaining_positions(self, strategy_names, bid_price, ask_price, exit_timestamp):
         buy_price, sell_price = self._get_prices(bid_price, ask_price)
-
         for strategy_name in strategy_names:
             if strategy_name == 'news_sentiment' and self.allow_news_overlap:
-                # close every stacked position
                 for pos in list(self.multi_slot_positions['news_sentiment']):
-                    self._close_single_position('news_sentiment', pos, sell_price, buy_price)
+                    self._close_single_position('news_sentiment', pos, sell_price, buy_price, exit_timestamp)
                 self.multi_slot_positions['news_sentiment'].clear()
             else:
-                self.close_position(strategy_name, sell_price, buy_price)
+                self.close_position(strategy_name, sell_price, buy_price, exit_timestamp)
 
-    def simulate_trading_with_strategies(
-        self,
-        fx_timestamps,
-        actual_rates,
-        pred_rates,
-        bid_prices,
-        ask_prices,
-        news_timestamps,
-        news_sentiments,
-        strategy_names=None,
-    ):
-        """Simulate trading over a series of exchange rates using different strategies."""
-        
-        # Identify all FX timestamps that fall within normal market hours (09:00–17:00)
-        in_window_ts = [
-            (i, fx_timestamp)
-            for i, fx_timestamp in enumerate(fx_timestamps)
-            if datetime.time(9, 0) <= fx_timestamp.time() <= datetime.time(17, 0)
-        ]
+    def simulate_trading_with_strategies(self, fx_timestamps, actual_rates, pred_rates, bid_prices, ask_prices, news_timestamps, news_sentiments, strategy_names=None):
+        in_window_ts = [(i, ts) for i, ts in enumerate(fx_timestamps) if datetime.time(9, 0) <= ts.time() <= datetime.time(17, 0)]
+        in_window_news = [(i, ts) for i, ts in enumerate(news_timestamps) if datetime.time(9, 0) <= ts.time() <= datetime.time(17, 0)]
 
-        # Identify all news timestamps that fall within normal market hours (09:00–17:00)
-        in_window_news = [
-            (i, news_timestamp)
-            for i, news_timestamp in enumerate(news_timestamps)
-            if datetime.time(9, 0) <= news_timestamp.time() <= datetime.time(17, 0)
-        ]
-
-        # Require at least a start and end point within the market hours for FX data
-        if len(in_window_ts) < 2:
-            return
-
-        # Require at least a start and end point within the market hours for news data
-        news_enabled = True
-        if len(in_window_news) < 2:
-            news_enabled = False
+        if len(in_window_ts) < 2: return
+        news_enabled = len(in_window_news) >= 2
 
         (first_fx_idx, first_fx_timestamp), (last_fx_idx, last_fx_timestamp) = in_window_ts[0], in_window_ts[-1]
 
-        # If news is disabled, set news slices to empty lists
         if news_enabled:
             (first_news_idx, first_news_timestamp), (last_news_idx, last_news_timestamp) = in_window_news[0], in_window_news[-1]
-            news_timestamps_train = news_timestamps[:first_news_idx]
-            news_sentiments_train = news_sentiments[:first_news_idx]
             news_timestamps_test = news_timestamps[first_news_idx:last_news_idx + 1]
             news_sentiments_test = news_sentiments[first_news_idx:last_news_idx + 1]
         else:
-            news_timestamps_train, news_sentiments_train = [], []
             news_timestamps_test, news_sentiments_test = [], []
 
         fx_timestamps_test = fx_timestamps[first_fx_idx:last_fx_idx + 1]
@@ -879,68 +721,32 @@ class TradingStrategy():
         bid_prices_test = bid_prices[first_fx_idx:last_fx_idx + 1]
         ask_prices_test = ask_prices[first_fx_idx:last_fx_idx + 1]
 
-        # Default to all base strategies unless a subset is explicitly provided
-        if strategy_names is None:
-            base_strategy_names = ['mean_reversion', 'trend', 'model_driven']
-        else:
-            base_strategy_names = strategy_names
+        base_strategy_names = strategy_names if strategy_names else ['mean_reversion', 'trend', 'model_driven']
 
         for strategy_name in base_strategy_names:
-            self._execute_trading_strategy(
-                strategy_name,
-                fx_timestamps_test,
-                actual_rates_test,
-                pred_rates_test,
-                bid_prices_test,
-                ask_prices_test,
-            )
+            self._execute_trading_strategy(strategy_name, fx_timestamps_test, actual_rates_test, pred_rates_test, bid_prices_test, ask_prices_test)
 
-        # MA crossover only needs actual rates (no model predictions)
         run_ma_crossover = (strategy_names is None or 'ma_crossover' in strategy_names)
         if run_ma_crossover:
-            self._execute_ma_crossover_strategy(
-                fx_timestamps_test,
-                actual_rates_test,
-                bid_prices_test,
-                ask_prices_test,
-            )
+            self._execute_ma_crossover_strategy(fx_timestamps_test, actual_rates_test, bid_prices_test, ask_prices_test)
 
         if news_enabled:
-            self._execute_news_sentiment_strategy(
-                fx_timestamps_test,
-                bid_prices_test,
-                ask_prices_test,
-                news_timestamps_test,
-                news_sentiments_test,
-            )
+            self._execute_news_sentiment_strategy(fx_timestamps_test, bid_prices_test, ask_prices_test, news_timestamps_test, news_sentiments_test)
 
-        # Phase 4: Close remaining positions and calculate results
         all_strategy_names = list(base_strategy_names)
-        if run_ma_crossover:
-            all_strategy_names.append('ma_crossover')
-        if news_enabled:
-            all_strategy_names.append('news_sentiment')
-        self._close_all_remaining_positions(all_strategy_names, bid_prices_test[-1], ask_prices_test[-1])
+        if run_ma_crossover: all_strategy_names.append('ma_crossover')
+        if news_enabled: all_strategy_names.append('news_sentiment')
+        
+        self._close_all_remaining_positions(all_strategy_names, bid_prices_test[-1], ask_prices_test[-1], fx_timestamps_test[-1])
 
     def simulate_trading_with_ensemble_strategy(self, fx_timestamps, actual_rates, pred_rates, bid_prices, ask_prices, seed=42):
-        """Simulate trading over a series of exchange rates using ensemble strategy."""
-        # Identify all FX timestamps that fall within normal market hours (09:00–17:00)
-        in_window_ts = [
-            (i, fx_timestamp)
-            for i, fx_timestamp in enumerate(fx_timestamps)
-            if datetime.time(9, 0) <= fx_timestamp.time() <= datetime.time(17, 0)
-        ]
-
-        # Require at least a start and end point within the market hours for FX data
-        if len(in_window_ts) < 2:
-            return
+        in_window_ts = [(i, ts) for i, ts in enumerate(fx_timestamps) if datetime.time(9, 0) <= ts.time() <= datetime.time(17, 0)]
+        if len(in_window_ts) < 2: return
 
         (first_fx_idx, first_fx_timestamp), (last_fx_idx, last_fx_timestamp) = in_window_ts[0], in_window_ts[-1]
 
-        # Phase 1: Train/test splits for FX data for training ensemble model
         actual_rates_train_before = actual_rates[:first_fx_idx]
         pred_rates_train_before = {model_name: preds[:first_fx_idx] for model_name, preds in pred_rates.items()}
-
         actual_rates_train_rest = actual_rates[first_fx_idx:]
         pred_rates_train_rest = {model_name: preds[first_fx_idx:] for model_name, preds in pred_rates.items()}
 
@@ -950,20 +756,14 @@ class TradingStrategy():
         bid_prices_test = bid_prices[first_fx_idx:last_fx_idx + 1]
         ask_prices_test = ask_prices[first_fx_idx:last_fx_idx + 1]
 
-        # Phase 2: Train ensemble model
         prior_training_data = self._generate_training_data(actual_rates_train_before, pred_rates_train_before)
         self.global_historical_data.extend(prior_training_data)
         self.train_ensemble_model(self.global_historical_data, seed)
 
-        # Phase 3: Execute trading strategies
         self._execute_ensemble_strategy(fx_timestamps_test, actual_rates_test, pred_rates_test, bid_prices_test, ask_prices_test)
 
-        # Phase 4: Close remaining positions and calculate results
-        all_strategy_names = ['ensemble']
-        self._close_all_remaining_positions(all_strategy_names, bid_prices_test[-1], ask_prices_test[-1])
+        self._close_all_remaining_positions(['ensemble'], bid_prices_test[-1], ask_prices_test[-1], fx_timestamps_test[-1])
 
         later_training_data = self._generate_training_data(actual_rates_train_rest, pred_rates_train_rest)
         self.global_historical_data.extend(later_training_data)
-        
-        # Increment day counter for next simulation
         self.current_day_index += 1
